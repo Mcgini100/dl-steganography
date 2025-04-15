@@ -1,7 +1,6 @@
-torch>=1.8.0
-torchvision>=0.9.0
+torch
+torchvision
+Pillow
 numpy
-opencv-python-headless
-scikit-image
-Pillow # For image loading/saving, often used with torchvision
-lpips # For perceptual loss (optional but good) - pip install lpips
+tqdm
+kornia # For advanced noise simulation like JPEG
