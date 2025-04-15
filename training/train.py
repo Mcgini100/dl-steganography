@@ -33,7 +33,8 @@ def main(args):
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.num_workers,
-        pin_memory=True # Helps speed up CPU-GPU transfer
+        pin_memory=True, # Helps speed up CPU-GPU transfer
+        drop_last=True
     )
     print(f"Dataset loaded with {len(train_dataset)} images.")
 
