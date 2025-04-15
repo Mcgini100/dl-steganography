@@ -1,55 +1,55 @@
 import torch
 import torch.nn as nn
-from .common_blocks import conv_block
+from .common_blocks import ConvBlock
 
 class Decoder(nn.Module):
-    """Decoder network to extract secret bits from a stego image."""
-    def __init__(self, secret_len=256, img_channels=3, initial_filters=64):
+    """
+    Decoder Network: Extracts the embedded message from a (potentially noisy) image.
+    Input: Container image (batch_size, 3, H, W)
+    Output: Extracted message logits (batch_size, message_length)
+    """
+    def __init__(self, message_length, image_size, hidden_dim=64):
         super(Decoder, self).__init__()
-        f = initial_filters
+        self.message_length = message_length
+        self.image_size = image_size
 
+        # Convolutional layers to extract features relevant to the message
         self.conv_layers = nn.Sequential(
-            conv_block(img_channels, f), # (B, 3, H, W) -> (B, 64, H, W)
-            conv_block(f, f),
-            conv_block(f, f * 2, stride=2), # Downsample H/2, W/2 -> (B, 128, H/2, W/2)
-            conv_block(f * 2, f * 2),
-            conv_block(f * 2, f * 4, stride=2), # Downsample H/4, W/4 -> (B, 256, H/4, W/4)
-            conv_block(f * 4, f * 4),
-            conv_block(f * 4, f * 8, stride=2), # Downsample H/8, W/8 -> (B, 512, H/8, W/8)
-            # Add more layers if needed
+            ConvBlock(3, hidden_dim, kernel_size=3, stride=1, padding=1),
+            ConvBlock(hidden_dim, hidden_dim, kernel_size=3, stride=2, padding=1), # Downsample
+            ConvBlock(hidden_dim, hidden_dim*2, kernel_size=3, stride=1, padding=1),
+            ConvBlock(hidden_dim*2, hidden_dim*2, kernel_size=3, stride=2, padding=1), # Downsample
+            ConvBlock(hidden_dim*2, hidden_dim*4, kernel_size=3, stride=1, padding=1),
+            ConvBlock(hidden_dim*4, hidden_dim*4, kernel_size=3, stride=2, padding=1), # Downsample
+            # Add more blocks if needed
         )
 
-        # Adaptive pooling to handle variable input sizes to some extent, outputs fixed size
-        self.adaptive_pool = nn.AdaptiveAvgPool2d((4, 4)) # Output size 4x4
+        # Calculate the size after convolutions and downsampling
+        # Example: If image_size=128, after 3 strides of 2 -> 128 / 2 / 2 / 2 = 16
+        final_spatial_dim = image_size // (2**3) # Adjust based on number of stride=2 layers
+        final_channels = hidden_dim * 4 # Adjust based on final ConvBlock output channels
 
-        # Fully connected layers to map features to secret length
-        # Input features depend on last conv channels and pooling output size
-        fc_input_features = f * 8 * 4 * 4
+        # Global Average Pooling or Flatten + Linear
+        self.pool = nn.AdaptiveAvgPool2d((1, 1)) # Output (batch_size, final_channels, 1, 1)
+
+        # Fully connected layers to predict the message bits
         self.fc_layers = nn.Sequential(
-            nn.Linear(fc_input_features, fc_input_features // 4),
+            nn.Linear(final_channels, hidden_dim * 2),
             nn.ReLU(inplace=True),
-            nn.Linear(fc_input_features // 4, secret_len)
-            # No activation here, raw logits are often used with BCEWithLogitsLoss
-            # Or use Sigmoid here if using BCELoss
+            nn.Linear(hidden_dim * 2, message_length)
+            # No final activation here if using BCEWithLogitsLoss during training
+            # Add nn.Sigmoid() or nn.Tanh() if using BCELoss or MSELoss respectively for the message
         )
-
-        # Optional: Add Sigmoid if using BCELoss later
-        self.output_activation = nn.Sigmoid()
-
 
     def forward(self, image):
-        """
-        Args:
-            image (torch.Tensor): Batch of stego images (B, C, H, W), normalized [0, 1].
-        Returns:
-            torch.Tensor: Batch of decoded secret bits probabilities (B, SecretLen), values [0, 1].
-        """
+        # 1. Pass through convolutional layers
         features = self.conv_layers(image)
-        features = self.adaptive_pool(features)
-        features = features.view(features.size(0), -1) # Flatten features
-        secret_logits = self.fc_layers(features)
 
-        # Apply sigmoid to get probabilities [0, 1]
-        secret_probs = self.output_activation(secret_logits)
+        # 2. Pool features
+        pooled_features = self.pool(features)
+        pooled_features = pooled_features.view(pooled_features.size(0), -1) # Flatten: (batch_size, final_channels)
 
-        return secret_probs # Output probabilities
+        # 3. Pass through fully connected layers to get message logits
+        message_logits = self.fc_layers(pooled_features)
+
+        return message_logits # Return logits

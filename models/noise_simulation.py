@@ -1,66 +1,97 @@
 import torch
-import torchvision.transforms.functional as TF
-from PIL import Image
-import io
+import torch.nn as nn
 import random
-import numpy as np
+import torchvision.transforms.functional as TF
+import kornia # Use kornia for more advanced augmentations like JPEG
 
-# --- Simple Noise Functions (Applied OUTSIDE model graph during training loop) ---
+# Ensure kornia is installed: pip install kornia
 
-def apply_jpeg_bytes(img_tensor_batch: torch.Tensor, quality: int) -> torch.Tensor:
-    """Applies JPEG compression by saving/loading via bytes buffer."""
-    device = img_tensor_batch.device
-    batch_size, _, h, w = img_tensor_batch.shape
-    result_batch = torch.zeros_like(img_tensor_batch)
+class NoiseLayer(nn.Module):
+    """
+    Applies random noise/distortions to images during training.
+    Simulates real-world conditions the embedded image might face.
+    """
+    def __init__(self, noise_level=0.1, jpeg_quality_range=(50, 95), blur_kernel_range=(3, 7), dropout_prob=0.1):
+        super(NoiseLayer, self).__init__()
+        self.noise_level = noise_level
+        self.jpeg_quality_min, self.jpeg_quality_max = jpeg_quality_range
+        self.blur_kernel_min, self.blur_kernel_max = blur_kernel_range
+        self.dropout_prob = dropout_prob
 
-    for i in range(batch_size):
-        img_tensor = img_tensor_batch[i] # Get single image C, H, W
-        try:
-            # Convert tensor [0,1] to PIL Image
-            img_np = img_tensor.cpu().detach().numpy()
-            img_np = np.transpose(img_np, (1, 2, 0)) # C, H, W -> H, W, C
-            img_np = np.clip(img_np * 255.0, 0, 255).astype(np.uint8)
-            img_pil = Image.fromarray(img_np)
+        # Kornia requires input tensor in [0, 1] range for JPEG compression
+        # If your network uses [-1, 1], you need to rescale before and after JPEG.
 
-            # Save to bytes buffer as JPEG
-            buffer = io.BytesIO()
-            img_pil.save(buffer, format='JPEG', quality=quality)
-            buffer.seek(0)
+    def apply_gaussian_noise(self, image):
+        noise = torch.randn_like(image) * self.noise_level
+        return image + noise
 
-            # Load back from buffer
-            img_pil_jpeg = Image.open(buffer).convert('RGB')
+    def apply_jpeg_compression(self, image):
+        # Kornia JPEG works on [0, 1] range, BxCxHxW float tensor
+        # Assuming input `image` is in [-1, 1] range from Encoder (Tanh output)
+        image_01 = (image + 1.0) / 2.0 # Rescale to [0, 1]
 
-            # Convert back to tensor [0,1]
-            img_tensor_jpeg = TF.to_tensor(img_pil_jpeg) # Scales to [0.0, 1.0]
-            result_batch[i] = img_tensor_jpeg
+        quality = torch.tensor(random.randint(self.jpeg_quality_min, self.jpeg_quality_max)).float().to(image.device)
+        jpeg_compressor = kornia.augmentation.RandomJPEG(p=1.0, quality=(self.jpeg_quality_min, self.jpeg_quality_max)) # Apply JPEG to all images in batch with random quality
+        image_jpeg_01 = jpeg_compressor(image_01)
 
-        except Exception as e:
-            print(f"Warning: Error during JPEG simulation (Q={quality}): {e}. Returning original.")
-            result_batch[i] = img_tensor # Return original if error
+        # Rescale back to [-1, 1]
+        image_jpeg = (image_jpeg_01 * 2.0) - 1.0
+        return image_jpeg
 
-    return result_batch.to(device)
+    def apply_gaussian_blur(self, image):
+        kernel_size = random.choice(list(range(self.blur_kernel_min, self.blur_kernel_max + 1, 2))) # Odd kernel sizes
+        # Use torchvision functional transform for simplicity here
+        # Note: Requires PIL images or tensors depending on version/method
+        # Kornia provides tensor-based blurring too: kornia.filters.gaussian_blur2d
+        blurred_image = kornia.filters.gaussian_blur2d(image, (kernel_size, kernel_size), sigma=(1.5, 1.5))
+        return blurred_image
+
+    def apply_dropout(self, image):
+        # Simulate information loss by randomly zeroing out patches or pixels
+        # Using spatial dropout
+        dropout_layer = nn.Dropout2d(p=self.dropout_prob)
+        return dropout_layer(image)
 
 
-def add_gaussian_noise(img_tensor_batch: torch.Tensor, std_dev: float) -> torch.Tensor:
-    """Adds Gaussian noise to image tensor batch [0, 1]."""
-    noise = torch.randn_like(img_tensor_batch) * std_dev
-    noisy_img = img_tensor_batch + noise
-    return torch.clamp(noisy_img, 0.0, 1.0)
+    def forward(self, x):
+        if not self.training: # Only apply noise during training
+            return x
 
-def apply_random_noise(stego_image_batch: torch.Tensor) -> torch.Tensor:
-    """Applies a random selection of noise layers."""
-    device = stego_image_batch.device
-    processed_batch = stego_image_batch.clone() # Work on a copy
+        batch_size = x.size(0)
+        device = x.device
+        noisy_images = []
 
-    # Apply noise layers with certain probabilities
-    if random.random() < 0.8: # High chance of JPEG
-        quality = random.randint(50, 95)
-        processed_batch = apply_jpeg_bytes(processed_batch, quality)
+        for i in range(batch_size):
+            image = x[i:i+1] # Process one image at a time (keep batch dim)
 
-    if random.random() < 0.3: # Lower chance of Gaussian noise
-        std = random.uniform(0, 0.1) # Noise level up to 10%
-        processed_batch = add_gaussian_noise(processed_batch, std)
+            # Randomly choose which noise(s) to apply
+            choice = random.choice(['identity', 'noise', 'jpeg', 'blur', 'dropout', 'all']) # Can add more combinations
 
-    # Add other distortions like blur, dropout, etc. here if needed
+            if choice == 'noise':
+                image = self.apply_gaussian_noise(image)
+            elif choice == 'jpeg':
+                 # Check if kornia is available before trying to use it
+                if 'kornia' in globals():
+                    image = self.apply_jpeg_compression(image)
+                else:
+                     print("Warning: Kornia not available. Skipping JPEG compression.")
+                     image = self.apply_gaussian_noise(image) # Fallback perhaps
+            elif choice == 'blur':
+                 image = self.apply_gaussian_blur(image)
+            elif choice == 'dropout':
+                 image = self.apply_dropout(image)
+            elif choice == 'all': # Apply a sequence
+                 image = self.apply_gaussian_noise(image)
+                 if 'kornia' in globals():
+                     image = self.apply_jpeg_compression(image)
+                 image = self.apply_gaussian_blur(image)
+                 image = self.apply_dropout(image)
+            # 'identity' means no noise applied for this image
 
-    return processed_batch.to(device)
+            # Clamp image values back to the expected range after adding noise/distortions
+            # Important if network expects specific range (e.g., [-1, 1] from Tanh)
+            image = torch.clamp(image, -1.0, 1.0) # Adjust range if necessary (e.g., [0, 1])
+
+            noisy_images.append(image)
+
+        return torch.cat(noisy_images, dim=0)
